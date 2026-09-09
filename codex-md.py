@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.6.4)
+Codex Session Manager & Markdown Converter  (v2.6.5)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -83,6 +83,7 @@ ROLLOUT_ID_RE = re.compile(
 # Function name → sub-category mapping
 # Built from scanning 223 session files (21 unique function names)
 TERMINAL_FUNCS = {'exec_command', 'execute_command', 'run_command', 'shell', 'shell_command', 'write_stdin', 'send_input'}
+PATCH_FUNCS = {'apply_patch'}
 OTHER_TOOL_FUNCS = {'spawn_agent', 'wait_agent', 'close_agent', 'update_plan',
                     'request_user_input', 'view_image', 'list_mcp_resources',
                     'read_mcp_resource', 'list_mcp_resource_templates'}
@@ -99,6 +100,7 @@ _CODE_MODE_COMMAND_RE = re.compile(
 
 def classify_tool(name: str, namespace: str = '') -> str:
     """Classify a function_call name into a sub-category key."""
+    if name in PATCH_FUNCS:          return 'custom_tool_call'
     if name in TERMINAL_FUNCS:       return 'terminal_cmd'
     if name.startswith('mcp__'):     return 'mcp_tool'
     if name in OTHER_TOOL_FUNCS:     return 'other_tool'
@@ -120,7 +122,7 @@ def _decode_code_mode_string(value: str, quote: str) -> str:
     return value
 
 def _extract_code_mode_commands(source: str) -> List[str]:
-    if not isinstance(source, str) or not _CODE_MODE_TOOL_CALL_RE.search(source):
+    if not isinstance(source, str):
         return []
     commands: List[str] = []
     for match in _CODE_MODE_COMMAND_RE.finditer(source):
@@ -150,6 +152,260 @@ def _classify_code_mode_exec(source: str) -> Tuple[str, str]:
     if tool_match:
         return 'other_tool', tool_match.group(1)
     return 'other_tool', 'exec'
+
+def _find_js_call_end(source: str, open_paren: int) -> int:
+    depth = 1
+    quote = ''
+    escaped = False
+    line_comment = False
+    block_comment = False
+    i = open_paren + 1
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ''
+        if line_comment:
+            if ch in '\r\n':
+                line_comment = False
+            i += 1
+            continue
+        if block_comment:
+            if ch == '*' and nxt == '/':
+                block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+        elif ch == '/' and nxt == '/':
+            line_comment = True
+            i += 2
+            continue
+        elif ch == '/' and nxt == '*':
+            block_comment = True
+            i += 2
+            continue
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return len(source)
+
+def _extract_code_mode_calls(source: str) -> List[Dict]:
+    """Extract actual top-level tools.<name>(...) calls from a Code Mode wrapper."""
+    if not isinstance(source, str):
+        return []
+    calls: List[Dict] = []
+    i = 0
+    quote = ''
+    escaped = False
+    line_comment = False
+    block_comment = False
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ''
+        if line_comment:
+            if ch in '\r\n':
+                line_comment = False
+            i += 1
+            continue
+        if block_comment:
+            if ch == '*' and nxt == '/':
+                block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            i += 1
+            continue
+        if ch == '/' and nxt == '/':
+            line_comment = True
+            i += 2
+            continue
+        if ch == '/' and nxt == '*':
+            block_comment = True
+            i += 2
+            continue
+        prefix = None
+        if source.startswith('tools.', i):
+            prefix = 'tools.'
+        elif source.startswith('functions.', i):
+            prefix = 'functions.'
+        if prefix and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] == '_')):
+            name_start = i + len(prefix)
+            name_end = name_start
+            while name_end < len(source) and (source[name_end].isalnum() or source[name_end] == '_'):
+                name_end += 1
+            name = source[name_start:name_end]
+            open_paren = name_end
+            while open_paren < len(source) and source[open_paren].isspace():
+                open_paren += 1
+            if name and open_paren < len(source) and source[open_paren] == '(':
+                close_paren = _find_js_call_end(source, open_paren)
+                calls.append({
+                    'name': name,
+                    'arguments': source[open_paren + 1:close_paren],
+                    'raw': source[i:min(close_paren + 1, len(source))],
+                })
+                i = close_paren + 1
+                continue
+        i += 1
+    return calls
+
+def _decode_first_js_string(arguments: str) -> str:
+    text = str(arguments or '').lstrip()
+    if not text or text[0] not in ('"', "'", '`'):
+        return text
+    quote = text[0]
+    escaped = False
+    for i in range(1, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch == quote:
+            return _decode_code_mode_string(text[1:i], quote)
+    return text
+
+def _normalize_path_key(path: str) -> str:
+    return str(path or '').strip().strip(chr(34)).strip(chr(39)).replace('\\', '/').rstrip('/').casefold()
+
+def _patch_paths_from_text(text: str) -> Set[str]:
+    paths: Set[str] = set()
+    for line in str(text or '').splitlines():
+        stripped = line.strip()
+        for prefix in ('*** Add File:', '*** Update File:', '*** Delete File:', '*** Move to:'):
+            if stripped.startswith(prefix):
+                path = _normalize_path_key(stripped[len(prefix):])
+                if path:
+                    paths.add(path)
+    return paths
+
+def _turn_id_from_payload(payload: Dict) -> str:
+    meta = payload.get('internal_chat_message_metadata_passthrough', {})
+    if isinstance(meta, dict) and meta.get('turn_id'):
+        return str(meta['turn_id'])
+    return str(payload.get('turn_id') or '')
+
+def _code_mode_descriptors(source: str) -> List[Dict]:
+    descriptors: List[Dict] = []
+    for call in _extract_code_mode_calls(source):
+        name = call['name']
+        raw_args = call.get('arguments', '')
+        if name in PATCH_FUNCS:
+            content = _decode_first_js_string(raw_args)
+            descriptors.append({
+                'type': 'custom_tool_call', 'name': name, 'content': content,
+                'patch_paths': _patch_paths_from_text(content),
+            })
+        elif name in TERMINAL_FUNCS:
+            commands = _extract_code_mode_commands(call.get('raw', ''))
+            arguments = commands[0] if len(commands) == 1 else ({'commands': commands} if commands else raw_args)
+            descriptors.append({
+                'type': 'terminal_cmd', 'name': name, 'arguments': arguments,
+                'commands': commands or [str(arguments)],
+            })
+        elif name.startswith('mcp__'):
+            descriptors.append({'type': 'mcp_tool', 'name': name, 'arguments': raw_args})
+        else:
+            descriptors.append({'type': 'other_tool', 'name': name, 'arguments': raw_args})
+    if not descriptors:
+        descriptors.append({'type': 'other_tool', 'name': 'exec', 'arguments': source})
+    return descriptors
+
+def _normalize_output_fields(payload: Dict) -> str:
+    parts: List[str] = []
+    for key in ('output', 'stdout', 'stderr', 'content', 'content_items', 'response',
+                'result', 'results', 'outputs', 'tools', 'error'):
+        if key not in payload:
+            continue
+        text = _normalize_tool_output(payload.get(key))
+        if text and text not in parts:
+            parts.append(text)
+    if parts:
+        return ''.join(parts)
+    return str(payload.get('status') or '')
+
+def _file_change_patch(item: Dict) -> str:
+    changes = item.get('changes', {})
+    if not isinstance(changes, dict) or not changes:
+        return _normalize_tool_output(item.get('patch') or item.get('diff') or item)
+    blocks: List[str] = ['*** Begin Patch']
+    for path, raw_change in changes.items():
+        change = raw_change if isinstance(raw_change, dict) else {}
+        kind = str(change.get('type') or 'update').lower()
+        if kind == 'add':
+            blocks.append(f'*** Add File: {path}')
+            content = change.get('content')
+            if isinstance(content, str):
+                blocks.extend('+' + line for line in content.splitlines())
+        elif kind == 'delete':
+            blocks.append(f'*** Delete File: {path}')
+        else:
+            blocks.append(f'*** Update File: {path}')
+            move_path = change.get('move_path') or change.get('movePath')
+            if move_path:
+                blocks.append(f'*** Move to: {move_path}')
+            diff = change.get('unified_diff') or change.get('unifiedDiff') or change.get('diff')
+            if isinstance(diff, str) and diff:
+                blocks.append(diff.rstrip())
+    blocks.append('*** End Patch')
+    return '\n'.join(blocks)
+
+def _file_change_paths(item: Dict) -> Set[str]:
+    changes = item.get('changes', {})
+    if not isinstance(changes, dict):
+        return set()
+    paths: Set[str] = set()
+    for path, raw_change in changes.items():
+        key = _normalize_path_key(path)
+        if key:
+            paths.add(key)
+        if isinstance(raw_change, dict):
+            move_path = raw_change.get('move_path') or raw_change.get('movePath')
+            if move_path:
+                paths.add(_normalize_path_key(move_path))
+    return {path for path in paths if path}
+
+def _canonical_mcp_name(item: Dict) -> str:
+    server = str(item.get('server') or '')
+    tool = str(item.get('tool') or item.get('name') or 'mcp')
+    if tool.startswith('mcp__'):
+        return tool
+    safe_tool = re.sub(r'[^A-Za-z0-9_]+', '_', tool).strip('_')
+    safe_server = re.sub(r'[^A-Za-z0-9_]+', '_', server).strip('_')
+    return f'mcp__{safe_server}__{safe_tool}' if safe_server else f'mcp__{safe_tool}'
+
+def _response_item_arguments(payload: Dict):
+    for key in ('arguments', 'input', 'command', 'commands', 'query', 'action', 'patch', 'diff'):
+        if key in payload and payload.get(key) not in (None, ''):
+            return payload.get(key)
+    ignored = {'type', 'id', 'call_id', 'status', 'internal_chat_message_metadata_passthrough'}
+    return {key: value for key, value in payload.items() if key not in ignored}
 
 def _normalize_tool_output(value) -> str:
     if value is None:
@@ -240,6 +496,7 @@ ALL_SECTION_KEYS = {s[0] for s in SECTION_DEFS}
 TOOL_OUTPUT_MAP = {
     'terminal_cmd':  'terminal_output',
     'mcp_tool':      'mcp_tool_output',
+    'custom_tool_call': 'custom_tool_output',
     'other_tool':    'other_tool_output',
 }
 
@@ -573,6 +830,9 @@ class SessionParser:
         self.latest_input_tokens = 0
         self.model_context_window = 0
         self._call_id_map: Dict[str, str] = {}
+        self._call_meta_map: Dict[str, Dict] = {}
+        self._code_mode_call_map: Dict[str, List[Dict]] = {}
+        self._canonical_dynamic_output_ids: Set[str] = set()
         self._load()
 
     def _append_dialog_message(self, msg_type: str, ts: str, content: str):
@@ -600,6 +860,8 @@ class SessionParser:
                     continue
 
         self._dedupe_code_mode_terminal_fallbacks()
+        self._dedupe_patch_fallbacks()
+        self._dedupe_mcp_fallbacks()
 
         # Derive title
         thread_id = self.metadata.get('id')
@@ -634,26 +896,174 @@ class SessionParser:
 
     def _dedupe_code_mode_terminal_fallbacks(self):
         canonical_commands = [
-            str(item.get('arguments', '')) for item in self.data
+            item for item in self.data
             if item.get('type') == 'terminal_cmd' and item.get('_canonical_terminal')
         ]
         if not canonical_commands:
             return
-        redundant_call_ids: Set[str] = set()
+        redundant_keys: Set[str] = set()
+        used_canonical: Set[int] = set()
         for item in self.data:
             if item.get('type') != 'terminal_cmd' or not item.get('_code_mode_fallback'):
                 continue
             fallback_commands = item.get('_code_mode_commands') or [item.get('arguments', '')]
-            if any(_commands_equivalent(fallback, canonical)
-                   for fallback in fallback_commands for canonical in canonical_commands):
-                call_id = item.get('call_id')
-                if call_id:
-                    redundant_call_ids.add(call_id)
-        if redundant_call_ids:
+            for index, canonical in enumerate(canonical_commands):
+                if index in used_canonical:
+                    continue
+                if any(_commands_equivalent(fallback, canonical.get('arguments', '')) for fallback in fallback_commands):
+                    key = item.get('_fallback_key')
+                    if key:
+                        redundant_keys.add(key)
+                    used_canonical.add(index)
+                    break
+        if redundant_keys:
             self.data = [
                 item for item in self.data
-                if not (item.get('_code_mode_fallback') and item.get('call_id') in redundant_call_ids)
+                if item.get('_fallback_key') not in redundant_keys
             ]
+
+    def _append_file_change(self, ts: str, item: Dict, turn_id: str = ''):
+        call_id = item.get('id') or item.get('call_id')
+        patch = _file_change_patch(item)
+        output = _normalize_output_fields(item)
+        if not output:
+            output = f"Patch {item.get('status') or 'completed'}."
+        common = {
+            'timestamp': ts, 'call_id': call_id, '_canonical_patch': True,
+            '_turn_id': turn_id, '_patch_paths': _file_change_paths(item),
+        }
+        self.data.append({**common, 'type': 'custom_tool_call', 'name': 'apply_patch', 'content': patch})
+        self.data.append({**common, 'type': 'custom_tool_output', 'content': output})
+
+    def _append_mcp_tool_call(self, ts: str, item: Dict, turn_id: str = ''):
+        call_id = item.get('id') or item.get('call_id')
+        common = {
+            'timestamp': ts, 'call_id': call_id, '_canonical_mcp': True,
+            '_turn_id': turn_id,
+        }
+        self.data.append({
+            **common, 'type': 'mcp_tool', 'name': _canonical_mcp_name(item),
+            'arguments': item.get('arguments', {}),
+        })
+        output = _normalize_output_fields(item)
+        if output:
+            self.data.append({**common, 'type': 'mcp_tool_output', 'output': output})
+
+    def _append_dynamic_tool_call(self, ts: str, item: Dict, turn_id: str = ''):
+        call_id = item.get('id') or item.get('call_id')
+        namespace = str(item.get('namespace') or '')
+        tool = str(item.get('tool') or item.get('name') or 'dynamic_tool')
+        if tool == 'apply_patch':
+            cat = 'custom_tool_call'
+        elif tool.startswith('mcp__') or namespace.casefold().startswith('mcp'):
+            cat = 'mcp_tool'
+        else:
+            cat = classify_tool(tool, namespace)
+
+        arguments = item.get('arguments', {})
+        has_embedded_output = any(
+            key in item for key in ('content_items', 'output', 'result', 'results', 'error')
+        )
+        if call_id:
+            call_types = set(TOOL_OUTPUT_MAP)
+            output_types = set(TOOL_OUTPUT_MAP.values())
+            self.data = [
+                existing for existing in self.data
+                if not (
+                    existing.get('call_id') == call_id and
+                    (existing.get('type') in call_types or
+                     (has_embedded_output and existing.get('type') in output_types))
+                )
+            ]
+        common = {
+            'timestamp': ts, 'call_id': call_id, '_turn_id': turn_id,
+            '_canonical_dynamic_tool': True,
+        }
+        if cat == 'custom_tool_call':
+            content = arguments.get('patch') if isinstance(arguments, dict) else None
+            content = content if isinstance(content, str) else _normalize_tool_output(arguments)
+            self.data.append({**common, 'type': cat, 'name': tool, 'content': content})
+        else:
+            name = _canonical_mcp_name({'server': namespace, 'tool': tool}) if cat == 'mcp_tool' else tool
+            display_arguments = arguments
+            if cat == 'terminal_cmd' and isinstance(arguments, dict):
+                display_arguments = (
+                    arguments.get('cmd') or arguments.get('command') or
+                    arguments.get('input') or arguments
+                )
+            self.data.append({
+                **common, 'type': cat, 'name': name, 'arguments': display_arguments,
+            })
+
+        if call_id:
+            self._call_id_map[call_id] = cat
+            self._call_meta_map[call_id] = {'cat': cat, 'turn_id': turn_id}
+        if has_embedded_output:
+            output = _normalize_output_fields(item)
+            if output:
+                out_cat = TOOL_OUTPUT_MAP.get(cat, 'other_tool_output')
+                field = 'content' if out_cat == 'custom_tool_output' else 'output'
+                self.data.append({**common, 'type': out_cat, field: output})
+                if call_id:
+                    self._canonical_dynamic_output_ids.add(call_id)
+
+    def _dedupe_patch_fallbacks(self):
+        canonical = [(index, item) for index, item in enumerate(self.data)
+                     if item.get('type') == 'custom_tool_call' and item.get('_canonical_patch')]
+        fallbacks = [(index, item) for index, item in enumerate(self.data)
+                     if item.get('type') == 'custom_tool_call' and item.get('_patch_fallback_key')]
+        if not canonical or not fallbacks:
+            return
+        remove_keys: Set[str] = set()
+        used: Set[int] = set()
+        for canonical_pos, current in canonical:
+            cturn = current.get('_turn_id', '')
+            cpaths = set(current.get('_patch_paths') or set())
+            best = None
+            best_pos = -1
+            for index, (fallback_pos, fallback) in enumerate(fallbacks):
+                if index in used or fallback_pos >= canonical_pos:
+                    continue
+                fturn = fallback.get('_turn_id', '')
+                if cturn and fturn and cturn != fturn:
+                    continue
+                fpaths = set(fallback.get('_patch_paths') or set())
+                overlap = len(cpaths & fpaths) if cpaths and fpaths else 0
+                if cpaths and fpaths and not overlap:
+                    continue
+                if fallback_pos > best_pos:
+                    best = index
+                    best_pos = fallback_pos
+            if best is not None:
+                used.add(best)
+                remove_keys.add(fallbacks[best][1]['_patch_fallback_key'])
+        if remove_keys:
+            self.data = [item for item in self.data if item.get('_patch_fallback_key') not in remove_keys]
+
+    def _dedupe_mcp_fallbacks(self):
+        canonical = [item for item in self.data if item.get('type') == 'mcp_tool' and item.get('_canonical_mcp')]
+        fallbacks = [item for item in self.data if item.get('type') == 'mcp_tool' and item.get('_mcp_fallback_key')]
+        if not canonical or not fallbacks:
+            return
+        remove_keys: Set[str] = set()
+        used: Set[int] = set()
+        for fallback in fallbacks:
+            fturn = fallback.get('_turn_id', '')
+            fname = re.sub(r'[^a-z0-9]+', '_', str(fallback.get('name', '')).casefold()).strip('_')
+            for index, current in enumerate(canonical):
+                if index in used:
+                    continue
+                cturn = current.get('_turn_id', '')
+                cname = re.sub(r'[^a-z0-9]+', '_', str(current.get('name', '')).casefold()).strip('_')
+                if fturn and cturn and fturn != cturn:
+                    continue
+                if fname and cname and fname != cname:
+                    continue
+                used.add(index)
+                remove_keys.add(fallback['_mcp_fallback_key'])
+                break
+        if remove_keys:
+            self.data = [item for item in self.data if item.get('_mcp_fallback_key') not in remove_keys]
 
     # --- entry processing (ALL 23 discovered patterns) ---
     def _process_entry(self, entry: Dict, line_num: int):
@@ -741,10 +1151,23 @@ class SessionParser:
             if isinstance(idata, dict) and idata.get('type') == 'CommandExecution':
                 self._append_command_execution(ts, idata)
                 return
+            if isinstance(idata, dict) and idata.get('type') == 'FileChange':
+                self._append_file_change(ts, idata, str(payload.get('turn_id') or ''))
+                return
+            if isinstance(idata, dict) and idata.get('type') == 'McpToolCall':
+                self._append_mcp_tool_call(ts, idata, str(payload.get('turn_id') or ''))
+                return
+            if isinstance(idata, dict) and idata.get('type') == 'DynamicToolCall':
+                self._append_dynamic_tool_call(ts, idata, str(payload.get('turn_id') or ''))
+                return
 
         # 7b ─ Legacy completed command event retained by Codex rollout migration
         if etype == 'event_msg' and ptype == 'exec_command_end':
             self._append_command_execution(ts, payload)
+            return
+
+        if etype == 'event_msg' and ptype == 'patch_apply_end':
+            self._append_file_change(ts, payload, str(payload.get('turn_id') or ''))
             return
 
         # 7c ─ Context compacted / thread rolled back / turn aborted / item completed
@@ -808,28 +1231,45 @@ class SessionParser:
                 fname = payload.get('name', '')
                 cat = classify_tool(fname, payload.get('namespace', ''))
                 call_id = payload.get('call_id')
-                self.data.append({
-                    'type': cat, 'timestamp': ts,
-                    'name': fname,
-                    'arguments': payload.get('arguments', ''),
-                    'call_id': call_id,
-                    '_tool_cat': cat,  # save category for output matching
-                })
+                turn_id = _turn_id_from_payload(payload)
+                fallback_key = f'function:{call_id or line_num}'
+                if cat == 'custom_tool_call':
+                    content = _normalize_tool_output(payload.get('arguments', ''))
+                    self.data.append({
+                        'type': cat, 'timestamp': ts, 'name': fname, 'content': content,
+                        'call_id': call_id, '_patch_fallback_key': fallback_key,
+                        '_turn_id': turn_id, '_patch_paths': _patch_paths_from_text(content),
+                    })
+                else:
+                    self.data.append({
+                        'type': cat, 'timestamp': ts, 'name': fname,
+                        'arguments': payload.get('arguments', ''), 'call_id': call_id,
+                    })
                 # Remember call_id → category for output pairing
                 if call_id:
                     self._call_id_map[call_id] = cat
+                    self._call_meta_map[call_id] = {
+                        'cat': cat, 'turn_id': turn_id,
+                        'patch_fallback_key': fallback_key if cat == 'custom_tool_call' else None,
+                    }
                 return
 
             # 10c ─ Function call output  (matched to its call's category)
             if ptype == 'function_call_output':
                 call_id = payload.get('call_id')
+                if call_id in self._canonical_dynamic_output_ids:
+                    return
                 parent_cat = self._call_id_map.get(call_id, 'other_tool')
                 out_cat = TOOL_OUTPUT_MAP.get(parent_cat, 'other_tool_output')
-                self.data.append({
-                    'type': out_cat, 'timestamp': ts,
-                    'output': _normalize_tool_output(payload.get('output', '')),
-                    'call_id': call_id,
-                })
+                output = _normalize_tool_output(payload.get('output', ''))
+                meta = self._call_meta_map.get(call_id, {})
+                if out_cat == 'custom_tool_output':
+                    self.data.append({
+                        'type': out_cat, 'timestamp': ts, 'content': output, 'call_id': call_id,
+                        '_patch_fallback_key': meta.get('patch_fallback_key'), '_turn_id': meta.get('turn_id', ''),
+                    })
+                else:
+                    self.data.append({'type': out_cat, 'timestamp': ts, 'output': output, 'call_id': call_id})
                 return
 
             # 10d ─ Code Mode exec wrapper, or a real custom tool (apply_patch, etc.)
@@ -837,32 +1277,82 @@ class SessionParser:
                 name = payload.get('name', 'custom_tool')
                 source = payload.get('input', '')
                 call_id = payload.get('call_id')
+                turn_id = _turn_id_from_payload(payload)
                 if name == 'exec':
-                    cat, display_name = _classify_code_mode_exec(source)
-                    commands = _extract_code_mode_commands(source) if cat == 'terminal_cmd' else []
-                    arguments = commands[0] if len(commands) == 1 else ({'commands': commands} if commands else source)
-                    self.data.append({
-                        'type': cat, 'timestamp': ts,
-                        'name': display_name, 'arguments': arguments,
-                        'call_id': call_id,
-                        '_code_mode_fallback': cat == 'terminal_cmd',
-                        '_code_mode_commands': commands,
-                    })
-                    if call_id:
-                        self._call_id_map[call_id] = cat
-                    return
+                    descriptors = _code_mode_descriptors(source)
+                    if descriptors:
+                        mapped: List[Dict] = []
+                        for index, descriptor in enumerate(descriptors):
+                            cat = descriptor['type']
+                            fallback_key = f'code:{call_id or line_num}:{index}'
+                            if cat == 'custom_tool_call':
+                                self.data.append({
+                                    'type': cat, 'timestamp': ts, 'name': descriptor.get('name', 'apply_patch'),
+                                    'content': descriptor.get('content', ''), 'call_id': call_id,
+                                    '_patch_fallback_key': fallback_key, '_turn_id': turn_id,
+                                    '_patch_paths': descriptor.get('patch_paths', set()),
+                                })
+                            else:
+                                self.data.append({
+                                    'type': cat, 'timestamp': ts, 'name': descriptor.get('name', 'tool'),
+                                    'arguments': descriptor.get('arguments', ''), 'call_id': call_id,
+                                    '_code_mode_fallback': cat == 'terminal_cmd',
+                                    '_code_mode_commands': descriptor.get('commands', []),
+                                    '_fallback_key': fallback_key,
+                                    '_mcp_fallback_key': fallback_key if cat == 'mcp_tool' else None,
+                                    '_turn_id': turn_id,
+                                })
+                            mapped.append({'cat': cat, 'fallback_key': fallback_key, 'turn_id': turn_id})
+                        if call_id:
+                            self._code_mode_call_map[call_id] = mapped
+                        return
                 self.data.append({
                     'type': 'custom_tool_call', 'timestamp': ts,
                     'name': name,
                     'content': source,
                     'call_id': call_id,
+                    '_patch_fallback_key': f'custom:{call_id or line_num}' if name in PATCH_FUNCS else None,
+                    '_turn_id': turn_id,
+                    '_patch_paths': _patch_paths_from_text(source) if name in PATCH_FUNCS else set(),
                 })
+                if call_id and name in PATCH_FUNCS:
+                    self._call_meta_map[call_id] = {
+                        'cat': 'custom_tool_call', 'turn_id': turn_id,
+                        'patch_fallback_key': f'custom:{call_id or line_num}',
+                    }
                 return
 
             # 10e ─ Custom tool output
             if ptype == 'custom_tool_call_output':
                 call_id = payload.get('call_id')
+                if call_id in self._canonical_dynamic_output_ids:
+                    return
                 output = _normalize_tool_output(payload.get('output', ''))
+                if call_id in self._code_mode_call_map:
+                    for meta in self._code_mode_call_map[call_id]:
+                        cat = meta['cat']
+                        out_cat = TOOL_OUTPUT_MAP.get(cat, 'other_tool_output')
+                        if out_cat == 'custom_tool_output':
+                            self.data.append({
+                                'type': out_cat, 'timestamp': ts, 'content': output, 'call_id': call_id,
+                                '_patch_fallback_key': meta['fallback_key'], '_turn_id': meta.get('turn_id', ''),
+                            })
+                        else:
+                            self.data.append({
+                                'type': out_cat, 'timestamp': ts, 'output': output, 'call_id': call_id,
+                                '_code_mode_fallback': cat == 'terminal_cmd',
+                                '_fallback_key': meta['fallback_key'],
+                                '_mcp_fallback_key': meta['fallback_key'] if cat == 'mcp_tool' else None,
+                                '_turn_id': meta.get('turn_id', ''),
+                            })
+                    return
+                meta = self._call_meta_map.get(call_id, {})
+                if meta.get('cat') == 'custom_tool_call':
+                    self.data.append({
+                        'type': 'custom_tool_output', 'timestamp': ts, 'content': output, 'call_id': call_id,
+                        '_patch_fallback_key': meta.get('patch_fallback_key'), '_turn_id': meta.get('turn_id', ''),
+                    })
+                    return
                 parent_cat = self._call_id_map.get(call_id)
                 if parent_cat in TOOL_OUTPUT_MAP:
                     self.data.append({
@@ -876,6 +1366,86 @@ class SessionParser:
                     'content': output,
                     'call_id': call_id,
                 })
+                return
+
+            direct_call_types = {
+                'apply_patch_call': ('custom_tool_call', 'apply_patch'),
+                'shell_call': ('terminal_cmd', 'shell'),
+                'local_shell_call': ('terminal_cmd', 'local_shell'),
+                'mcp_call': ('mcp_tool', 'mcp'),
+                'mcp_list_tools': ('mcp_tool', 'mcp_list_tools'),
+                'mcp_approval_request': ('mcp_tool', 'mcp_approval'),
+                'tool_search_call': ('other_tool', 'tool_search'),
+                'file_search_call': ('other_tool', 'file_search'),
+                'computer_call': ('other_tool', 'computer'),
+                'code_interpreter_call': ('other_tool', 'code_interpreter'),
+                'image_generation_call': ('other_tool', 'image_generation'),
+            }
+            if ptype in direct_call_types:
+                cat, default_name = direct_call_types[ptype]
+                call_id = payload.get('call_id') or payload.get('id')
+                turn_id = _turn_id_from_payload(payload)
+                name = payload.get('name') or payload.get('tool') or default_name
+                arguments = _response_item_arguments(payload)
+                fallback_key = f'direct:{call_id or line_num}'
+                if cat == 'custom_tool_call':
+                    content = _normalize_tool_output(arguments)
+                    self.data.append({
+                        'type': cat, 'timestamp': ts, 'name': name, 'content': content,
+                        'call_id': call_id, '_patch_fallback_key': fallback_key,
+                        '_turn_id': turn_id, '_patch_paths': _patch_paths_from_text(content),
+                    })
+                else:
+                    self.data.append({
+                        'type': cat, 'timestamp': ts, 'name': name, 'arguments': arguments,
+                        'call_id': call_id, '_code_mode_fallback': cat == 'terminal_cmd',
+                        '_fallback_key': fallback_key,
+                        '_mcp_fallback_key': fallback_key if cat == 'mcp_tool' else None,
+                        '_turn_id': turn_id,
+                    })
+                if call_id:
+                    self._call_id_map[call_id] = cat
+                    self._call_meta_map[call_id] = {
+                        'cat': cat, 'turn_id': turn_id,
+                        'patch_fallback_key': fallback_key if cat == 'custom_tool_call' else None,
+                    }
+                embedded_output_types = {
+                    'mcp_call', 'mcp_list_tools', 'file_search_call',
+                    'code_interpreter_call', 'image_generation_call',
+                }
+                if ptype in embedded_output_types and any(
+                    key in payload for key in ('output', 'content_items', 'result', 'results', 'outputs', 'tools', 'error')
+                ):
+                    out_cat = TOOL_OUTPUT_MAP.get(cat, 'other_tool_output')
+                    embedded = _normalize_output_fields(payload)
+                    if embedded:
+                        self.data.append({
+                            'type': out_cat, 'timestamp': ts, 'output': embedded, 'call_id': call_id,
+                        })
+                return
+
+            direct_output_types = {
+                'apply_patch_call_output': 'custom_tool_output',
+                'shell_call_output': 'terminal_output',
+                'local_shell_call_output': 'terminal_output',
+                'mcp_approval_response': 'mcp_tool_output',
+                'tool_search_output': 'other_tool_output',
+                'computer_call_output': 'other_tool_output',
+            }
+            if ptype in direct_output_types:
+                call_id = payload.get('call_id') or payload.get('id')
+                if call_id in self._canonical_dynamic_output_ids:
+                    return
+                out_cat = direct_output_types[ptype]
+                output = _normalize_output_fields(payload)
+                meta = self._call_meta_map.get(call_id, {})
+                if out_cat == 'custom_tool_output':
+                    self.data.append({
+                        'type': out_cat, 'timestamp': ts, 'content': output, 'call_id': call_id,
+                        '_patch_fallback_key': meta.get('patch_fallback_key'), '_turn_id': meta.get('turn_id', ''),
+                    })
+                else:
+                    self.data.append({'type': out_cat, 'timestamp': ts, 'output': output, 'call_id': call_id})
                 return
 
             # 10f ─ Web search
@@ -905,11 +1475,22 @@ class SessionParser:
                 return
 
             # 10i ─ Raw assistant / user messages. Some logs have no event_msg mirror.
+            if ptype == 'agent_message':
+                self._append_dialog_message('agent_message', ts, payload.get('content', []))
+                return
             if ptype == 'message' and role == 'assistant':
                 self._append_dialog_message('agent_message', ts, payload.get('content', []))
                 return
             if ptype == 'message' and role == 'user':
                 self._append_dialog_message('user_message', ts, payload.get('content', []))
+                return
+
+            if ptype in ('compaction', 'context_compaction', 'compaction_trigger',
+                         'configuration_update', 'additional_tools', 'item_reference'):
+                self.data.append({
+                    'type': 'session_event', 'timestamp': ts, 'event': ptype,
+                    'content': ptype.replace('_', ' ').title(),
+                })
                 return
 
         # Everything else is silently ignored.
